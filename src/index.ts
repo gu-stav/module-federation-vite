@@ -11,6 +11,7 @@ import type {
   ViteDevServer,
 } from 'vite';
 import { version as viteVersion } from 'vite';
+import { createDependencyPreparation } from './dependencyPreparation';
 import { createChunkPlacement } from './chunkPlacement';
 import addEntry, { getBuildInput } from './plugins/pluginAddEntry';
 import { checkAliasConflicts } from './plugins/pluginCheckAliasConflicts';
@@ -21,13 +22,7 @@ import pluginManifest from './plugins/pluginMFManifest';
 import pluginModuleParseEnd, { createModuleParseController } from './plugins/pluginModuleParseEnd';
 import pluginProxyRemoteEntry from './plugins/pluginProxyRemoteEntry';
 import pluginProxyRemotes from './plugins/pluginProxyRemotes';
-import {
-  excludeSharedSubDependencies,
-  findSharedKey,
-  getSharedPackageFromFile,
-  isSharedPackageDependency,
-  proxySharedModule,
-} from './plugins/pluginProxySharedModule_preBuild';
+import { findSharedKey, proxySharedModule } from './plugins/pluginProxySharedModule_preBuild';
 import { pluginRemoteNamedExports } from './plugins/pluginRemoteNamedExports';
 import { pluginSSRRemoteEntry } from './plugins/pluginSSRRemoteEntry';
 import pluginVarRemoteEntry from './plugins/pluginVarRemoteEntry';
@@ -48,13 +43,11 @@ import {
 import { isTestEnv } from './utils/isTestEnv';
 import { createModuleFederationError, mfWarn } from './utils/logger';
 import { getSharedExportConditions } from './utils/sharedExportConditions';
-import { getSharedRequest, getSharedRuntimeKey } from './utils/sharedKeyMatcher';
 import type {
   ModuleFederationOptions,
   NormalizedModuleFederationOptions,
   PluginExperimentsOptions,
   PluginManifestOptions,
-  ShareItem,
   SsrEntryLoaderConfig,
   SsrEntryLoaderStrategy,
   TreeShakingConfig,
@@ -65,16 +58,11 @@ import {
   normalizeModuleFederationOptions,
   resolveSharedVersions,
 } from './utils/normalizeModuleFederationOptions';
-import normalizeOptimizeDepsPlugin from './utils/normalizeOptimizeDeps';
 import {
   getIsRolldown,
-  getInstalledPackageEntry,
-  getInstalledPackageJson,
   getPackageName,
-  getPackageNameFromNodeModulePath,
   hasPackageDependency,
   resolveImportPath,
-  resolveModulePath,
   setPackageDetectionCwd,
 } from './utils/packageUtils';
 import {
@@ -87,16 +75,14 @@ import {
   isServerEnvironment,
   isSsrConfig,
   SSR_ENTRY_LOADER_SPECIFIER,
-  SSR_ONLY_RUNTIME_PLUGINS,
 } from './utils/ssrCapabilities';
 import { getRuntimePluginSpecifier } from './utils/runtimePluginSpecifier';
 import {
-  getCommonSharedSubpaths,
-  isAssetLikeImport,
-  isViteOptimizableEntry,
-} from './utils/pathNormalization';
-import { findModuleImportDescriptors, getScannableModuleSource } from './utils/htmlEntryUtils';
-import VirtualModule, { createViteEncodedIdPrefixRegExp } from './utils/VirtualModule';
+  findModuleImportDescriptors,
+  getScannableModuleSource,
+  type ModuleImportDescriptor,
+} from './utils/htmlEntryUtils';
+import VirtualModule from './utils/VirtualModule';
 import {
   getHostAutoInitPath,
   getPendingSharesPath,
@@ -116,7 +102,6 @@ import {
 } from './virtualModules';
 import { getVirtualExposesId } from './virtualModules/virtualExposes';
 import {
-  addConfiguredShare,
   addUsedShares,
   HOST_AUTO_INIT_TAG,
   isOwnedHostAutoInitId,
@@ -179,18 +164,6 @@ function ignoreFederationGeneratedFiles(
     return;
   }
   watchOptions.ignored = [ignored, federationIgnore];
-}
-
-function isSharedResolverInternalImporter(importer: string | undefined): boolean {
-  return !!importer && (importer.includes(LOAD_SHARE_TAG) || importer.includes('__prebuild__'));
-}
-
-function isCommonJsImporter(importer: string | undefined): boolean {
-  return !!importer && (importer.endsWith('.cjs') || importer.includes('/cjs/'));
-}
-
-function isReactDomSelfReference(source: string, importer: string | undefined): boolean {
-  return source === 'react-dom' && getPackageNameFromNodeModulePath(importer ?? '') === 'react-dom';
 }
 
 type ModulePreloadResolveContext = { hostId: string; hostType: 'html' | 'js' };
@@ -293,175 +266,6 @@ function isFederationHtmlPreloadDependency(dep: string, includeSharedRuntime = f
   );
 }
 
-// Returns false for subpaths that either aren't exported by the installed
-// package (e.g. react/compiler-runtime on React 18) or resolve to a file
-// Vite's optimizer refuses to bundle (e.g. raw .tsx source), so callers can
-// exclude them from Vite's dep optimizer instead of letting Vite silently
-// drop them with a "Cannot optimize dependency" warning every dev start.
-function canResolveSharedSubpath(subpath: string, projectRoot: string): boolean {
-  try {
-    return isViteOptimizableEntry(
-      resolveModulePath(subpath, path.join(projectRoot, 'package.json'))
-    );
-  } catch (error) {
-    // An ESM-only package (an `exports` map with no CommonJS `require`/`default`
-    // condition) makes Node's require.resolve throw ERR_PACKAGE_PATH_NOT_EXPORTED even
-    // though Vite's own resolver can resolve it. Excluding such a package from dependency
-    // optimization serves its raw CommonJS sub-dependencies to the browser in dev, which
-    // blanks the app. Resolve its import target and let Vite pre-bundle it (and its
-    // transitive CJS deps) with interop when the target is optimizable.
-    //
-    // Only apply this to a package's main entry (a bare specifier). A *subpath* can throw
-    // the same code simply because it isn't exported at all (e.g. react/compiler-runtime
-    // on React versions that predate it), which genuinely cannot be optimized and must
-    // stay excluded. https://github.com/module-federation/vite/issues/974
-    if (
-      (error as NodeJS.ErrnoException)?.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED' &&
-      !isBarePackageSubpath(subpath)
-    ) {
-      const entry = resolveViteImportPackageEntry(subpath, projectRoot);
-      return entry !== undefined && existsSync(entry) && isViteOptimizableEntry(entry);
-    }
-    return false;
-  }
-}
-
-const VITE_DEV_IMPORT_CONDITIONS = new Set([
-  'browser',
-  'development',
-  'import',
-  'module',
-  'default',
-]);
-
-function resolveConditionalExportTarget(target: unknown): string | undefined {
-  if (typeof target === 'string') return target;
-  if (Array.isArray(target)) {
-    for (const candidate of target) {
-      const resolved = resolveConditionalExportTarget(candidate);
-      if (resolved) return resolved;
-    }
-    return undefined;
-  }
-  if (!target || typeof target !== 'object') return undefined;
-
-  for (const [condition, candidate] of Object.entries(target)) {
-    if (!VITE_DEV_IMPORT_CONDITIONS.has(condition)) continue;
-    const resolved = resolveConditionalExportTarget(candidate);
-    if (resolved) return resolved;
-  }
-  return undefined;
-}
-
-function resolveViteImportPackageEntry(
-  packageName: string,
-  projectRoot: string
-): string | undefined {
-  const installed = getInstalledPackageJson(packageName, { cwd: projectRoot });
-  if (!installed) return undefined;
-
-  const exportsField = installed.packageJson.exports;
-  let rootExport: unknown = exportsField;
-  if (exportsField && typeof exportsField === 'object' && !Array.isArray(exportsField)) {
-    const exportsRecord = exportsField as Record<string, unknown>;
-    if (Object.keys(exportsRecord).some((key) => key.startsWith('.'))) {
-      rootExport = exportsRecord['.'];
-    }
-  }
-
-  const target = resolveConditionalExportTarget(rootExport);
-  if (!target?.startsWith('./')) return undefined;
-  const resolved = path.resolve(installed.dir, target);
-  const relative = path.relative(installed.dir, resolved);
-  if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return undefined;
-  return resolved;
-}
-
-// True when `specifier` addresses a subpath of a package (e.g. `react/compiler-runtime`)
-// rather than its main entry (e.g. `react` or `@scope/pkg`).
-function isBarePackageSubpath(specifier: string): boolean {
-  const segments = specifier.split('/');
-  return specifier.startsWith('@') ? segments.length > 2 : segments.length > 1;
-}
-
-/**
- * Vite's dependency scanner cannot see through the virtual loadShare modules
- * generated for shared packages. As a result, dependencies of a linked/shared
- * package may be discovered one request at a time and each discovery starts a
- * new optimizer pass. Seed the optimizer with the complete dependency graph
- * before the first request instead.
- *
- * Vite then resolves the package's own dependency graph using its normal
- * scanner, preserving package and peer-dependency resolution semantics.
- */
-function includeLinkedSharedEntries(
-  optimizeDeps: NonNullable<UserConfig['optimizeDeps']>,
-  shared: NormalizedModuleFederationOptions['shared'],
-  projectRoot: string,
-  exposes: NormalizedModuleFederationOptions['exposes'],
-  outDir: string
-): void {
-  const additions = new Set<string>();
-
-  const entries = new Set(
-    Array.isArray(optimizeDeps.entries)
-      ? optimizeDeps.entries
-      : optimizeDeps.entries
-        ? [optimizeDeps.entries]
-        : [
-            '**/*.html',
-            '!**/node_modules/**',
-            `!**/${outDir.replace(/\\/g, '/')}/**`,
-            '!**/__tests__/**',
-            '!**/coverage/**',
-          ]
-  );
-
-  for (const [packageName, share] of Object.entries(shared ?? {})) {
-    if (share?.shareConfig?.import === false) continue;
-    const configuredImport = share?.shareConfig?.import;
-    if (typeof configuredImport === 'string') {
-      const entry = path.isAbsolute(configuredImport)
-        ? configuredImport
-        : path.resolve(projectRoot, configuredImport);
-      if (existsSync(entry) && !entry.replaceAll('\\', '/').includes('/node_modules/')) {
-        additions.add(entry);
-        continue;
-      }
-    }
-    const installed = getInstalledPackageJson(packageName, { cwd: projectRoot });
-    if (!installed || installed.dir.replaceAll('\\', '/').includes('/node_modules/')) continue;
-    const entry = getInstalledPackageEntry(packageName, { cwd: projectRoot });
-    if (entry && existsSync(entry)) additions.add(entry);
-  }
-
-  for (const expose of Object.values(exposes ?? {})) {
-    const source = expose.import;
-    if (source.startsWith('.') || path.isAbsolute(source)) {
-      const entry = path.resolve(projectRoot, source);
-      if (existsSync(entry)) additions.add(entry);
-    }
-  }
-
-  if (additions.size === 0) return;
-
-  for (const entry of additions) entries.add(entry);
-  optimizeDeps.entries = [...entries];
-}
-
-function stabilizeOptimizeDeps(optimizeDeps: NonNullable<UserConfig['optimizeDeps']>): void {
-  optimizeDeps.include = [...new Set(optimizeDeps.include ?? [])].sort();
-  optimizeDeps.exclude = [...new Set(optimizeDeps.exclude ?? [])].sort();
-}
-
-function isFile(candidate: string): boolean {
-  try {
-    return statSync(candidate).isFile();
-  } catch {
-    return false;
-  }
-}
-
 // React Router's build plugin appends a synthetic `?__react-router-build-client-route`
 // entry per route that isn't a real module on disk, so it must be excluded before this
 // scan tries to read it as a source file.
@@ -500,42 +304,58 @@ function getAutomaticJsxRuntime(config: ResolvedConfig): string | undefined {
   return undefined;
 }
 
-function registerEntryImports(
+function scanEntryImports(
   options: NormalizedModuleFederationOptions,
   projectRoot: string,
-  recordShared = true,
+  registerSharedDependencies = true,
   entryFiles: string[] = []
 ): boolean {
   const sourceExtensions = ['.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx', '.vue', '.svelte'];
   const root = path.resolve(projectRoot);
-  const pending: Array<{ file: string; preloadRemotes: boolean }> = [];
-  const visited = new Map<string, boolean>();
-  let hasJsxSource = false;
-  const enqueue = (
+  const pendingFiles: Array<{ file: string; preloadStaticRemotes: boolean }> = [];
+  const scannedFiles = new Map<string, boolean>();
+  // Cache file lookups, including missing files, for this scan only.
+  // The next config hook must see edited and newly created files.
+  const resolvedImports = new Map<string, string | undefined>();
+  const importsByFile = new Map<string, ModuleImportDescriptor[]>();
+  let hasJsxFiles = false;
+  const addFileToScan = (
     request: string,
     importer = path.join(root, 'index.html'),
-    preloadRemotes = false
+    preloadStaticRemotes = false
   ) => {
-    const cleanRequest = request.replace(/[?#].*$/, '');
+    const importWithoutQuery = request.replace(/[?#].*$/, '');
     if (
-      !cleanRequest.startsWith('.') &&
-      !cleanRequest.startsWith('/') &&
-      !path.isAbsolute(cleanRequest)
+      !importWithoutQuery.startsWith('.') &&
+      !importWithoutQuery.startsWith('/') &&
+      !path.isAbsolute(importWithoutQuery)
     )
       return;
-    const base = cleanRequest.startsWith('/')
-      ? path.resolve(root, `.${cleanRequest}`)
-      : path.resolve(path.dirname(importer), cleanRequest);
+    const base = importWithoutQuery.startsWith('/')
+      ? path.resolve(root, `.${importWithoutQuery}`)
+      : path.resolve(path.dirname(importer), importWithoutQuery);
     const relative = path.relative(root, base);
     if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return;
-    const candidates = [
-      base,
-      ...sourceExtensions.map((extension) => `${base}${extension}`),
-      ...sourceExtensions.map((extension) => path.join(base, `index${extension}`)),
-    ];
-    const file = candidates.find(isFile);
-    if (file && (!visited.has(file) || (preloadRemotes && !visited.get(file)))) {
-      pending.push({ file, preloadRemotes });
+    if (!resolvedImports.has(base)) {
+      const candidates = [
+        base,
+        ...sourceExtensions.map((extension) => `${base}${extension}`),
+        ...sourceExtensions.map((extension) => path.join(base, `index${extension}`)),
+      ];
+      resolvedImports.set(
+        base,
+        candidates.find((candidate) => {
+          try {
+            return statSync(candidate).isFile();
+          } catch {
+            return false;
+          }
+        })
+      );
+    }
+    const file = resolvedImports.get(base);
+    if (file && (!scannedFiles.has(file) || (preloadStaticRemotes && !scannedFiles.get(file)))) {
+      pendingFiles.push({ file, preloadStaticRemotes });
     }
   };
 
@@ -551,49 +371,57 @@ function registerEntryImports(
       for (const match of html.matchAll(
         /<script\b(?=[^>]*\btype=["']module["'])(?=[^>]*\bsrc=(['"])([^'"]+)\1)[^>]*>/gi
       )) {
-        enqueue(match[2], htmlEntry, true);
+        addFileToScan(match[2], htmlEntry, true);
       }
     }
   }
   for (const entry of entryFiles.filter((file) => !file.endsWith('.html'))) {
     const relativeEntry = path.relative(root, entry);
-    enqueue(
+    addFileToScan(
       relativeEntry.startsWith('.') ? relativeEntry : `./${relativeEntry}`,
       path.join(root, 'index.html'),
       true
     );
   }
   for (const expose of Object.values(options.exposes ?? {})) {
-    enqueue(expose.import);
+    addFileToScan(expose.import);
   }
 
-  while (pending.length) {
-    const { file, preloadRemotes } = pending.pop()!;
-    if (visited.get(file) || (visited.has(file) && !preloadRemotes)) continue;
-    visited.set(file, preloadRemotes);
-    const code = getScannableModuleSource(file, readFileSync(file, 'utf8'));
-    if (JSX_SOURCE_EXTENSIONS.some((extension) => file.endsWith(extension))) hasJsxSource = true;
-    for (const { source: request, kind, typeOnly } of findModuleImportDescriptors(code)) {
+  while (pendingFiles.length) {
+    const { file, preloadStaticRemotes } = pendingFiles.pop()!;
+    if (scannedFiles.get(file) || (scannedFiles.has(file) && !preloadStaticRemotes)) continue;
+    scannedFiles.set(file, preloadStaticRemotes);
+    // A file first found through a dynamic import or an exposed module may also
+    // have a static import. Check its imports again for remote modules to preload,
+    // using the cached imports instead of reading and parsing the file again.
+    let imports = importsByFile.get(file);
+    if (!imports) {
+      const code = getScannableModuleSource(file, readFileSync(file, 'utf8'));
+      imports = findModuleImportDescriptors(code);
+      importsByFile.set(file, imports);
+    }
+    if (JSX_SOURCE_EXTENSIONS.some((extension) => file.endsWith(extension))) hasJsxFiles = true;
+    for (const { source: request, kind, typeOnly } of imports) {
       const isStatic = kind === 'static' && !typeOnly;
-      const remoteKey =
-        preloadRemotes && isStatic && request
+      const remoteAlias =
+        preloadStaticRemotes && isStatic && request
           ? Object.keys(options.remotes).find(
               (name) => request === name || request.startsWith(`${name}/`)
             )
           : undefined;
       const sharedKey = !typeOnly && request && findSharedKey(request, options.shared);
-      if (remoteKey) {
-        addUsedRemote(remoteKey, request, options);
+      if (remoteAlias) {
+        addUsedRemote(remoteAlias, request, options);
         markStaticRemote(request, options);
         markPreloadRemote(request, options);
-      } else if (sharedKey && recordShared) {
+      } else if (sharedKey && registerSharedDependencies) {
         addUsedShares(request, options);
       } else if (request && !typeOnly) {
-        enqueue(request, file, preloadRemotes && isStatic);
+        addFileToScan(request, file, preloadStaticRemotes && isStatic);
       }
     }
   }
-  return hasJsxSource;
+  return hasJsxFiles;
 }
 
 // The compiler injects this import after the textual entry scan. Materialize
@@ -616,9 +444,11 @@ function materializeAutomaticJsxRuntime(
  * This prevents 504 "Outdated Optimize Dep" errors by ensuring ids are known
  * before Vite's optimization phase.
  */
-function createEarlyVirtualModulesPlugin(options: NormalizedModuleFederationOptions): Plugin {
+function createEarlyVirtualModulesPlugin(
+  options: NormalizedModuleFederationOptions,
+  dependencies: ReturnType<typeof createDependencyPreparation>
+): Plugin {
   const { shared, remotes } = options;
-  const isLitShare = (pkg: string) => pkg === 'lit' || pkg.startsWith('lit/');
   let hasClientJsxSource = false;
   return {
     name: 'vite:module-federation-early-init',
@@ -663,15 +493,7 @@ function createEarlyVirtualModulesPlugin(options: NormalizedModuleFederationOpti
         for (const key of Object.keys(remotes)) {
           ensureUsedRemote(key, options);
         }
-        if (_command === 'serve') {
-          config.optimizeDeps = config.optimizeDeps || {};
-          config.optimizeDeps.exclude = config.optimizeDeps.exclude || [];
-          config.optimizeDeps.include = config.optimizeDeps.include || [];
-          // Prebundling bare remote specifiers rewrites imports like
-          // `import("remote/x")` to optimized dep files. That bypasses the
-          // remote namespace fixup path and can resolve same-named packages.
-          config.optimizeDeps.exclude.push(...Object.keys(remotes || {}));
-        }
+        dependencies.excludeRemotesFromOptimization(config, _command);
       }
 
       if (!config.build?.ssr && (hasShared(options) || hasRemotes(options))) {
@@ -679,7 +501,7 @@ function createEarlyVirtualModulesPlugin(options: NormalizedModuleFederationOpti
         // bootstrap. Keep share/optimize-deps discovery serve-only, but scan
         // the same client entry graph during build so the bootstrap can wait
         // for only the remotes imported synchronously by that graph.
-        const hasJsxSource = registerEntryImports(
+        const hasJsxSource = scanEntryImports(
           options,
           root,
           _command === 'serve',
@@ -688,254 +510,12 @@ function createEarlyVirtualModulesPlugin(options: NormalizedModuleFederationOpti
         if (_command === 'serve') hasClientJsxSource = hasJsxSource;
       }
 
-      // Create shared module virtual files EARLY and register shares eagerly
-      // so localSharedImportMap has content on first load in both serve/build.
-      if (hasShared(options)) {
-        if (_command === 'serve') {
-          excludeSharedSubDependencies(shared);
-          config.optimizeDeps = config.optimizeDeps || {};
-          config.optimizeDeps.include = config.optimizeDeps.include || [];
-          const optimizeDeps = config.optimizeDeps as UserConfig['optimizeDeps'] & {
-            rolldownOptions?: { plugins?: unknown[] };
-            esbuildOptions?: { plugins?: unknown[] };
-          };
-          if (isRolldown) {
-            optimizeDeps.rolldownOptions ??= {};
-            optimizeDeps.rolldownOptions.plugins ??= [];
-            optimizeDeps.rolldownOptions.plugins.push({
-              name: 'module-federation:optimize-shared-resolver',
-              load(id: string) {
-                const optimizedRequirePrefix = 'module-federation:optimized-require-';
-                if (!id.startsWith(optimizedRequirePrefix)) return;
-                const sourcePackage = id.slice(optimizedRequirePrefix.length);
-                if (sourcePackage !== 'react' && sourcePackage !== 'react-dom') return;
-                const loadSharePath = getLoadShareModulePath(sourcePackage, isRolldown, options);
-                // Keep the raw virtual id in Rolldown's generated optimized
-                // dependency. Vite runs import analysis over the emitted file;
-                // an already browser-encoded /@id/__x00__ specifier is treated
-                // as an ordinary absolute import there and cannot be resolved.
-                // The raw id is external to the optimizer, then resolved by the
-                // federation virtual-module plugin when the file is served.
-                const source = JSON.stringify(loadSharePath);
-                return (
-                  'import * as __mfShared from ' +
-                  source +
-                  ';\n' +
-                  'export * from ' +
-                  source +
-                  ';\n' +
-                  'export default __mfShared.default ?? __mfShared;'
-                );
-              },
-              resolveId(source: string, importer?: string, resolveOptions?: { kind?: string }) {
-                if (createViteEncodedIdPrefixRegExp('virtual:mf:').test(source)) {
-                  return { id: source, external: true };
-                }
-                if (isSharedResolverInternalImporter(importer)) return;
-                const key = findSharedKey(source, shared);
-                if (!key) return;
-                const importerPackage = getSharedPackageFromFile(importer, shared, root);
-                const reactDomSelfReference = isReactDomSelfReference(source, importer);
-                if (
-                  !reactDomSelfReference &&
-                  (importerPackage === getPackageName(key) ||
-                    (importerPackage && isSharedPackageDependency(key, importerPackage)))
-                )
-                  return;
-                if (isAssetLikeImport(source)) return;
-                const shareItem = shared[key];
-                const isReactSingleton =
-                  source === 'react' &&
-                  key === 'react' &&
-                  shareItem.shareConfig?.singleton === true;
-                const isReactRequire =
-                  resolveOptions?.kind?.startsWith('require') && isReactSingleton;
-                const isReactDomRequire =
-                  resolveOptions?.kind?.startsWith('require') &&
-                  isReactDomSelfReference(source, importer);
-                if (
-                  resolveOptions?.kind?.startsWith('require') &&
-                  !isReactRequire &&
-                  !isReactDomRequire
-                )
-                  return;
-                if (isCommonJsImporter(importer) && !isReactSingleton && !isReactDomRequire) return;
-                if (resolveOptions?.kind !== 'entry-point') addUsedShares(source, options);
-                if (isReactRequire || isReactDomRequire) {
-                  writeLoadShareModule(source, shareItem, _command, isRolldown, options);
-                  if (shareItem.shareConfig?.import !== false) {
-                    writePreBuildLibPath(source, shareItem, options);
-                  }
-                  return { id: `module-federation:optimized-require-${source}` };
-                }
-                const loadSharePath = getLoadShareModulePath(source, isRolldown, options);
-                writeLoadShareModule(source, shareItem, _command, isRolldown, options);
-                if (shareItem.shareConfig?.import !== false) {
-                  writePreBuildLibPath(source, shareItem, options);
-                }
-                return { id: loadSharePath, external: true };
-              },
-            });
-          } else {
-            optimizeDeps.esbuildOptions ??= {};
-            optimizeDeps.esbuildOptions.plugins ??= [];
-            optimizeDeps.esbuildOptions.plugins.push({
-              name: 'module-federation:optimize-shared-proxy',
-              setup(build: any) {
-                build.onResolve(
-                  { filter: createViteEncodedIdPrefixRegExp('virtual:mf:') },
-                  (args: any) => ({
-                    path: args.path,
-                    external: true,
-                  })
-                );
-                build.onResolve({ filter: /.*/ }, (args: any) => {
-                  if (args.kind === 'entry-point') return;
-                  if (!args.importer || args.namespace === 'mf-shared') return;
-                  if (isSharedResolverInternalImporter(args.importer)) return;
-                  const key = findSharedKey(args.path, shared);
-                  if (!key || isAssetLikeImport(args.path)) return;
-                  const importerPackage = getSharedPackageFromFile(args.importer, shared, root);
-                  if (
-                    importerPackage === getPackageName(args.path) &&
-                    !isReactDomSelfReference(args.path, args.importer)
-                  )
-                    return;
-                  if (importerPackage && isSharedPackageDependency(key, importerPackage)) return;
-                  addUsedShares(args.path, options);
-                  if (args.kind === 'import-statement' || args.kind === 'dynamic-import') {
-                    const shareItem = shared[key];
-                    const loadSharePath = getLoadShareModulePath(args.path, isRolldown, options);
-                    writeLoadShareModule(args.path, shareItem, _command, isRolldown, options);
-                    if (shareItem.shareConfig?.import !== false) {
-                      writePreBuildLibPath(args.path, shareItem, options);
-                    }
-                    return { path: loadSharePath, external: true };
-                  }
-                  return { path: args.path, namespace: 'mf-shared' };
-                });
-                build.onLoad({ filter: /.*/, namespace: 'mf-shared' }, (args: any) => {
-                  const key = findSharedKey(args.path, shared);
-                  if (!key) return;
-                  const shareItem = shared[key];
-                  const loadSharePath = getLoadShareModulePath(args.path, isRolldown, options);
-                  writeLoadShareModule(args.path, shareItem, _command, isRolldown, options);
-                  if (shareItem.shareConfig?.import !== false) {
-                    writePreBuildLibPath(args.path, shareItem, options);
-                  }
-                  return {
-                    loader: 'js',
-                    resolveDir: root,
-                    contents: `import * as __mfShared from ${JSON.stringify(loadSharePath)};
-export * from ${JSON.stringify(loadSharePath)};
-export default __mfShared.default ?? __mfShared;`,
-                  };
-                });
-              },
-            });
-          }
-        }
-        for (const key of Object.keys(shared)) {
-          const shareItem: ShareItem = shared[key];
-          const request = getSharedRequest(key, shareItem);
-          const runtimeKey = getSharedRuntimeKey(key, shareItem);
-          if (key.endsWith('/') || request.endsWith('/') || runtimeKey.endsWith('/')) {
-            if (_command === 'serve' && shareItem.shareConfig?.import !== false) {
-              const optimizeDeps = (config.optimizeDeps ??= {});
-              optimizeDeps.include ??= [];
-              optimizeDeps.exclude ??= [];
-              for (const subpath of getCommonSharedSubpaths(request)) {
-                writePreBuildLibPath(subpath, shareItem, options);
-                if (canResolveSharedSubpath(subpath, root)) {
-                  optimizeDeps.include.push(subpath);
-                } else {
-                  optimizeDeps.exclude.push(subpath);
-                }
-              }
-            }
-            continue;
-          }
-          if (isVinext && runtimeKey === 'react') {
-            addConfiguredShare(runtimeKey, options);
-            continue;
-          }
-          getLoadShareModulePath(runtimeKey, isRolldown, options);
-          writeLoadShareModule(runtimeKey, shareItem, _command, isRolldown, options);
-          // Skip prebuild for shared deps with import: false — the host must
-          // provide them, so no local fallback source is needed.
-          if (shareItem.shareConfig?.import !== false) {
-            writePreBuildLibPath(runtimeKey, shareItem, options);
-          }
-          addConfiguredShare(runtimeKey, options);
-          if (_command === 'serve' && shareItem.shareConfig?.import !== false) {
-            const optimizeDeps = (config.optimizeDeps ??= {});
-            optimizeDeps.include ??= [];
-            optimizeDeps.exclude ??= [];
-            // Lit must stay outside dependency optimization because its
-            // submodules rely on parent initialization order. Other shared
-            // deps, including singleton React, must remain optimizable so
-            // local prebuild fallbacks receive Vite's CJS-to-ESM interop.
-            // Singleton identity is enforced by the federation share cache
-            // and loadShare proxy, independently from dependency optimization.
-            // Shares resolving to raw .jsx/.tsx source can't be optimized by
-            // Vite at all, so route them to exclude the same way.
-            const shouldBypassOptimizeDep =
-              isLitShare(runtimeKey) || !canResolveSharedSubpath(runtimeKey, root);
-            if (optimizeDeps.include.includes(runtimeKey)) {
-              optimizeDeps.exclude = optimizeDeps.exclude.filter((dep) => dep !== runtimeKey);
-            } else if (shouldBypassOptimizeDep || optimizeDeps.exclude.includes(runtimeKey)) {
-              optimizeDeps.exclude.push(runtimeKey);
-            } else {
-              optimizeDeps.include.push(runtimeKey);
-            }
-            const commonSubpaths =
-              shareItem.shareConfig.request === undefined &&
-              shareItem.shareConfig.shareKey === undefined
-                ? getCommonSharedSubpaths(runtimeKey)
-                : [];
-            for (const subpath of commonSubpaths) {
-              const canResolveSubpath = canResolveSharedSubpath(subpath, root);
-              if (
-                ['react/compiler-runtime', 'react-dom/client', 'react-dom/profiling'].includes(
-                  subpath
-                ) &&
-                !canResolveSubpath
-              ) {
-                // These entry points only exist in newer React versions.
-                // Generating their prebuild wrappers for older versions creates
-                // imports that Vite cannot resolve.
-                optimizeDeps.exclude.push(subpath);
-                continue;
-              }
-              getLoadShareModulePath(subpath, isRolldown, options);
-              writeLoadShareModule(subpath, shareItem, _command, isRolldown, options);
-              writePreBuildLibPath(subpath, shareItem, options);
-              addConfiguredShare(subpath, options);
-              if (canResolveSubpath) {
-                optimizeDeps.include.push(subpath);
-                // Prevent subpaths like react-dom/client from using a later, incompatible optimizer generation.
-                if (runtimeKey === 'react-dom') {
-                  optimizeDeps.include.push(`${runtimeKey} > ${subpath}`);
-                }
-              } else {
-                optimizeDeps.exclude.push(subpath);
-              }
-            }
-          }
-        }
-        writeLocalSharedImportMap(options);
-      }
-      if (_command === 'serve') {
-        config.optimizeDeps ??= {};
-        includeLinkedSharedEntries(
-          config.optimizeDeps,
-          shared,
-          root,
-          options.exposes,
-          config.build?.outDir ?? 'dist'
-        );
-        stabilizeOptimizeDeps(config.optimizeDeps);
-      }
+      dependencies.prepareSharedDependencies(config, {
+        root,
+        command: _command,
+        isRolldown,
+        isVinext,
+      });
     },
 
     configResolved(config) {
@@ -1132,6 +712,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
 
   let command: string;
   const chunkPlacement = createChunkPlacement(options);
+  const dependencies = createDependencyPreparation(options);
   let isSsrBuild = false;
   let isProduction = false;
   let rootResolveConditions: string[] | undefined;
@@ -1331,7 +912,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
     },
     ...(options.experiments.externalRuntime ? [pluginExternalRuntimeCore()] : []),
     // This plugin runs FIRST to register virtual modules before optimization
-    createEarlyVirtualModulesPlugin(options),
+    createEarlyVirtualModulesPlugin(options, dependencies),
     ...(isVinext
       ? [
           {
@@ -1386,7 +967,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
     },
     aliasToArrayPlugin,
     checkAliasConflicts({ shared }),
-    normalizeOptimizeDepsPlugin,
+    dependencies.optimizeDepsPlugin,
     ...loadPluginDts(options),
     pluginDevRemoteHmr(options),
     {
@@ -1736,37 +1317,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
         config.build ||= {};
         config.build.commonjsOptions ||= {};
         config.build.commonjsOptions.strictRequires ??= 'auto';
-        config.optimizeDeps ||= {};
-        config.optimizeDeps.include ||= [];
-        config.optimizeDeps.include.push('@module-federation/runtime');
-        if (needsRuntimeHelpers) {
-          config.optimizeDeps.include.push('@module-federation/runtime/helpers');
-        }
-
-        // Add all runtime plugins to optimizeDeps to prevent 504 re-optimization.
-        // SSR-only plugins import Node modules — exclude them from browser optimisation.
-        options.runtimePlugins.forEach((p) => {
-          const pluginPath = getRuntimePluginSpecifier(p);
-          if (SSR_ONLY_RUNTIME_PLUGINS.has(pluginPath)) return;
-          // Only add bare imports to optimizeDeps
-          if (
-            pluginPath &&
-            !pluginPath.startsWith('.') &&
-            !pluginPath.startsWith('/') &&
-            !pluginPath.startsWith('\0') &&
-            !pluginPath.startsWith('virtual:')
-          ) {
-            let optimizeDep = pluginPath;
-            if (pluginPath === '@module-federation/dts-plugin/dynamic-remote-type-hints-plugin') {
-              try {
-                optimizeDep = normalizePathForImport(resolveImportPath(pluginPath));
-              } catch {
-                optimizeDep = pluginPath;
-              }
-            }
-            config.optimizeDeps!.include!.push(optimizeDep);
-          }
-        });
+        dependencies.includeRuntimeDependencies(config, needsRuntimeHelpers);
 
         if (isRolldown) {
           // Vite 8+: virtual modules use ESM.
