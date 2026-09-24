@@ -209,15 +209,23 @@ function createSharedOptimizerPlugins(
   shared: NormalizedShared,
   { root, command, isRolldown }: DependencyPreparationContext
 ) {
+  // Many imports resolve to the same wrapper during one optimization pass.
+  // Start fresh on the next pass; load hooks still refresh environment-specific code.
+  const preparedShares = new Map<string, ShareItem>();
   const writeSharedModules = (source: string, sharedDependency: ShareItem) => {
+    if (preparedShares.get(source) === sharedDependency) return;
     writeLoadShareModule(source, sharedDependency, command, isRolldown, options);
     if (sharedDependency.shareConfig?.import !== false)
       writePreBuildLibPath(source, sharedDependency, options);
+    preparedShares.set(source, sharedDependency);
   };
 
   return {
     rolldown: {
       name: 'module-federation:optimize-shared-resolver',
+      buildStart() {
+        preparedShares.clear();
+      },
       load(id) {
         const optimizedRequirePrefix = 'module-federation:optimized-require-';
         if (!id.startsWith(optimizedRequirePrefix)) return;
@@ -270,6 +278,9 @@ function createSharedOptimizerPlugins(
     esbuild: {
       name: 'module-federation:optimize-shared-proxy',
       setup(build) {
+        build.onStart(() => {
+          preparedShares.clear();
+        });
         build.onResolve({ filter: createViteEncodedIdPrefixRegExp('virtual:mf:') }, (request) => ({
           path: request.path,
           external: true,
