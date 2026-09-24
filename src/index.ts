@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { createRequire } from 'module';
 import * as path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'url';
@@ -14,6 +14,7 @@ import { version as viteVersion } from 'vite';
 import { createVirtualModuleLoading } from './virtualModuleLoading';
 import { createDependencyPreparation } from './dependencyPreparation';
 import { createChunkPlacement } from './chunkPlacement';
+import { scanEntryImports } from './entryScan';
 import addEntry, { getBuildInput } from './plugins/pluginAddEntry';
 import { checkAliasConflicts } from './plugins/pluginCheckAliasConflicts';
 import pluginDevRemoteHmr, { shouldIgnoreFile } from './plugins/pluginDevRemoteHmr';
@@ -77,11 +78,6 @@ import {
 } from './utils/ssrCapabilities';
 import { getRuntimePluginSpecifier } from './utils/runtimePluginSpecifier';
 import {
-  findModuleImportDescriptors,
-  getScannableModuleSource,
-  type ModuleImportDescriptor,
-} from './utils/htmlEntryUtils';
-import {
   getHostAutoInitPath,
   getRemoteEntryId,
   initVirtualModules,
@@ -90,12 +86,7 @@ import {
 } from './virtualModules';
 import { getVirtualExposesId } from './virtualModules/virtualExposes';
 import { addUsedShares } from './virtualModules/virtualRemoteEntry';
-import {
-  addUsedRemote,
-  ensureUsedRemote,
-  markPreloadRemote,
-  markStaticRemote,
-} from './virtualModules/virtualRemotes';
+import { ensureUsedRemote } from './virtualModules/virtualRemotes';
 import { getRuntimeInitStatusImportId } from './virtualModules/virtualRuntimeInitStatus';
 import { findEagerFallbacksInSharedChunk } from './virtualModules/loadShareSharedChunk';
 import { resetConcreteSharedImportSourceCache } from './virtualModules/virtualShared_preBuild';
@@ -225,11 +216,6 @@ function isReactRouterBuildClientRouteInput(entry: string): boolean {
   return /[?&]__react-router-build-client-route(?:[=&]|$)/.test(entry);
 }
 
-/**
- * Vite transforms JSX in these file types and can add a JSX runtime import.
- */
-const JSX_SOURCE_EXTENSIONS = ['.jsx', '.tsx'];
-
 type JsxTransformOptions = {
   jsx?: string | boolean | { runtime?: string; importSource?: string; development?: boolean };
   jsxImportSource?: string;
@@ -253,126 +239,6 @@ function getAutomaticJsxRuntime(config: ResolvedConfig): string | undefined {
     return `${importSource}/${development ? 'jsx-dev-runtime' : 'jsx-runtime'}`;
   }
   return undefined;
-}
-
-function scanEntryImports(
-  options: NormalizedModuleFederationOptions,
-  projectRoot: string,
-  registerSharedDependencies = true,
-  entryFiles: string[] = []
-): boolean {
-  const sourceExtensions = ['.mjs', '.js', '.mts', '.ts', '.jsx', '.tsx', '.vue', '.svelte'];
-  const root = path.resolve(projectRoot);
-  const pendingFiles: Array<{ file: string; preloadStaticRemotes: boolean }> = [];
-  const scannedFiles = new Map<string, boolean>();
-  // Cache file lookups, including missing files, for this scan only.
-  // The next config hook must see edited and newly created files.
-  const resolvedImports = new Map<string, string | undefined>();
-  const importsByFile = new Map<string, ModuleImportDescriptor[]>();
-  let hasJsxFiles = false;
-  const addFileToScan = (
-    request: string,
-    importer = path.join(root, 'index.html'),
-    preloadStaticRemotes = false
-  ) => {
-    const importWithoutQuery = request.replace(/[?#].*$/, '');
-    if (
-      !importWithoutQuery.startsWith('.') &&
-      !importWithoutQuery.startsWith('/') &&
-      !path.isAbsolute(importWithoutQuery)
-    )
-      return;
-    const base = importWithoutQuery.startsWith('/')
-      ? path.resolve(root, `.${importWithoutQuery}`)
-      : path.resolve(path.dirname(importer), importWithoutQuery);
-    const relative = path.relative(root, base);
-    if (relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return;
-    if (!resolvedImports.has(base)) {
-      const candidates = [
-        base,
-        ...sourceExtensions.map((extension) => `${base}${extension}`),
-        ...sourceExtensions.map((extension) => path.join(base, `index${extension}`)),
-      ];
-      resolvedImports.set(
-        base,
-        candidates.find((candidate) => {
-          try {
-            return statSync(candidate).isFile();
-          } catch {
-            return false;
-          }
-        })
-      );
-    }
-    const file = resolvedImports.get(base);
-    if (file && (!scannedFiles.has(file) || (preloadStaticRemotes && !scannedFiles.get(file)))) {
-      pendingFiles.push({ file, preloadStaticRemotes });
-    }
-  };
-
-  const htmlEntries = entryFiles.filter((file) => file.endsWith('.html'));
-  const htmlEntryPaths = htmlEntries.length
-    ? htmlEntries
-    : entryFiles.length === 0
-      ? [path.join(root, 'index.html')]
-      : [];
-  for (const htmlEntry of htmlEntryPaths) {
-    if (existsSync(htmlEntry)) {
-      const html = readFileSync(htmlEntry, 'utf8');
-      for (const match of html.matchAll(
-        /<script\b(?=[^>]*\btype=["']module["'])(?=[^>]*\bsrc=(['"])([^'"]+)\1)[^>]*>/gi
-      )) {
-        addFileToScan(match[2], htmlEntry, true);
-      }
-    }
-  }
-  for (const entry of entryFiles.filter((file) => !file.endsWith('.html'))) {
-    const relativeEntry = path.relative(root, entry);
-    addFileToScan(
-      relativeEntry.startsWith('.') ? relativeEntry : `./${relativeEntry}`,
-      path.join(root, 'index.html'),
-      true
-    );
-  }
-  for (const expose of Object.values(options.exposes ?? {})) {
-    addFileToScan(expose.import);
-  }
-
-  while (pendingFiles.length) {
-    const { file, preloadStaticRemotes } = pendingFiles.pop()!;
-    if (scannedFiles.get(file) || (scannedFiles.has(file) && !preloadStaticRemotes)) continue;
-    scannedFiles.set(file, preloadStaticRemotes);
-    // A file first found through a dynamic import or an exposed module may also
-    // have a static import. Check its imports again for remote modules to preload,
-    // using the cached imports instead of reading and parsing the file again.
-    let imports = importsByFile.get(file);
-    if (!imports) {
-      const code = getScannableModuleSource(file, readFileSync(file, 'utf8'));
-      imports = findModuleImportDescriptors(code);
-      importsByFile.set(file, imports);
-    }
-    if (JSX_SOURCE_EXTENSIONS.some((extension) => file.endsWith(extension))) hasJsxFiles = true;
-    for (const { source: request, kind, typeOnly } of imports) {
-      const isStatic = kind === 'static' && !typeOnly;
-      const remoteAlias =
-        preloadStaticRemotes && isStatic && request
-          ? Object.keys(options.remotes).find(
-              (name) => request === name || request.startsWith(`${name}/`)
-            )
-          : undefined;
-      const sharedKey = !typeOnly && request && findSharedKey(request, options.shared);
-      if (remoteAlias) {
-        addUsedRemote(remoteAlias, request, options);
-        markStaticRemote(request, options);
-        markPreloadRemote(request, options);
-      } else if (sharedKey && registerSharedDependencies) {
-        addUsedShares(request, options);
-      } else if (request && !typeOnly) {
-        addFileToScan(request, file, preloadStaticRemotes && isStatic);
-      }
-    }
-  }
-  return hasJsxFiles;
 }
 
 // JSX compilation adds an import after the source scan. Register the JSX runtime
@@ -446,6 +312,7 @@ function createEarlyVirtualModulesPlugin(
         // waits for the remote modules needed at startup. Register shared imports
         // only in the dev server, where they affect dependency optimization.
         const hasJsxFiles = scanEntryImports(
+          config,
           options,
           root,
           command === 'serve',

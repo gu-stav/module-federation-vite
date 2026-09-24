@@ -108,3 +108,65 @@ it('resolves relative imports and checks files before directory index files', ()
   });
   expect(entryScan.run().preloadedRemotes).toEqual(new Set(['remote/a-js', 'remote/b-directory']));
 });
+
+it('sees files edited or created by a config hook between plugin instances', () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'entry-scan-config-hooks-'));
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(path.join(root, 'src'));
+  writeFileSync(path.join(root, 'package.json'), '{}');
+  writeFileSync(path.join(root, 'src/main.ts'), 'import "./missing"; import "remote/old";');
+  const config = { root, build: { rollupOptions: { input: 'src/main.ts' } } };
+  const first = federation({
+    name: `${path.basename(root)}-first`,
+    remotes: { remote: 'http://localhost:5001/remoteEntry.js' },
+  });
+  const second = federation({
+    name: `${path.basename(root)}-second`,
+    remotes: { remote: 'http://localhost:5001/remoteEntry.js' },
+  });
+  const run = (plugins: typeof first) =>
+    callHook(
+      plugins.find((plugin) => plugin.name === 'vite:module-federation-early-init').config,
+      { meta: {} } as ConfigPluginContext,
+      config,
+      { command: 'build', mode: 'test' }
+    );
+  run(first);
+  writeFileSync(path.join(root, 'src/main.ts'), 'import "./missing"; import "remote/new";');
+  writeFileSync(path.join(root, 'src/missing.ts'), 'import "remote/created";');
+  run(second);
+  const options = second.find((plugin) => plugin.name === 'module-federation-vite')._options;
+  expect(getPreloadRemotes(options)).toEqual(new Set(['remote/new', 'remote/created']));
+});
+
+it('reuses unchanged source reads while keeping each instance’s remote imports separate', () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'entry-scan-shared-source-'));
+  onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(path.join(root, 'src'));
+  writeFileSync(path.join(root, 'package.json'), '{}');
+  const entry = path.join(root, 'src/main.ts');
+  writeFileSync(entry, 'import "first/value"; import "second/value";');
+  const config = { root, build: { rolldownOptions: { input: 'src/main.ts' } } };
+  const instances = ['first', 'second'].map((name) =>
+    federation({
+      name: `${path.basename(root)}-${name}`,
+      remotes: { [name]: 'http://localhost:5001/remoteEntry.js' },
+    })
+  );
+  vi.mocked(readFileSync).mockClear();
+  for (const plugins of instances) {
+    callHook(
+      plugins.find((plugin) => plugin.name === 'vite:module-federation-early-init').config,
+      { meta: {} } as ConfigPluginContext,
+      config,
+      { command: 'build', mode: 'test' }
+    );
+  }
+  for (const [index, plugins] of instances.entries()) {
+    const options = plugins.find((plugin) => plugin.name === 'module-federation-vite')._options;
+    expect(getPreloadRemotes(options)).toEqual(
+      new Set([`${index === 0 ? 'first' : 'second'}/value`])
+    );
+  }
+  expect(vi.mocked(readFileSync).mock.calls.filter(([file]) => file === entry)).toHaveLength(1);
+});
