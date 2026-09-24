@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync } from 'fs';
 import { createRequire } from 'module';
 import * as path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'url';
@@ -14,6 +14,7 @@ import { version as viteVersion } from 'vite';
 import { createVirtualModuleLoading } from './virtualModuleLoading';
 import { createDependencyPreparation } from './dependencyPreparation';
 import { createChunkPlacement } from './chunkPlacement';
+import { createChunkCleanup } from './chunkCleanup';
 import { scanEntryImports } from './entryScan';
 import addEntry, { getBuildInput } from './plugins/pluginAddEntry';
 import { checkAliasConflicts } from './plugins/pluginCheckAliasConflicts';
@@ -38,10 +39,6 @@ import {
   type Bundle,
 } from './utils/bundleHelpers';
 import { normalizePathForImport } from './utils/buildPaths';
-import {
-  isFederationControlChunk,
-  sanitizeFederationControlChunk,
-} from './utils/controlChunkSanitizer';
 import { isTestEnv } from './utils/isTestEnv';
 import { createModuleFederationError, mfWarn } from './utils/logger';
 import type {
@@ -499,6 +496,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
   const virtualExposesId = getVirtualExposesId(options);
   const virtualModules = createVirtualModuleLoading(options, remoteEntryId, virtualExposesId);
   const chunkPlacement = createChunkPlacement(options);
+  const chunkCleanup = createChunkCleanup(filename);
   const dependencySetup = createDependencyPreparation(options);
   const emittedRuntimeCapabilityWarnings = new Set<string>();
 
@@ -674,12 +672,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
           );
         }
 
-        for (const [fileName, chunk] of Object.entries(bundle)) {
-          if (!isOutputChunk(chunk)) continue;
-          if (!isFederationControlChunk(fileName, filename)) continue;
-
-          chunk.code = sanitizeFederationControlChunk(chunk.code, fileName, filename);
-        }
+        chunkCleanup.cleanBundle(bundle);
 
         // Rollup's CommonJS helpers can make a local fallback import a proxy that
         // imports loadShare. If loadShare is waiting for that fallback, neither
@@ -708,35 +701,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
         }
       },
     },
-    {
-      name: 'module-federation-strip-empty-preload-helper',
-      enforce: 'post',
-      apply: 'build',
-      renderChunk(code, chunk) {
-        if (!isFederationControlChunk(chunk.fileName, filename)) return;
-
-        const nextCode = sanitizeFederationControlChunk(code, chunk.fileName, filename);
-
-        return nextCode === code ? null : { code: nextCode, map: null };
-      },
-      writeBundle(outputOptions, bundle) {
-        if (!outputOptions.dir) return;
-
-        for (const chunk of Object.values(bundle)) {
-          if (!isOutputChunk(chunk)) continue;
-          if (!isFederationControlChunk(chunk.fileName, filename)) continue;
-
-          const outputPath = path.join(outputOptions.dir, chunk.fileName);
-          const nextCode = sanitizeFederationControlChunk(
-            readFileSync(outputPath, 'utf-8'),
-            chunk.fileName,
-            filename
-          );
-
-          writeFileSync(outputPath, nextCode);
-        }
-      },
-    } satisfies Plugin,
+    chunkCleanup.plugin,
     {
       name: 'module-federation-vite',
       enforce: 'post',
