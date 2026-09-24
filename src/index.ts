@@ -2,7 +2,14 @@ import { existsSync, readFileSync, statSync, writeFileSync } from 'fs';
 import { createRequire } from 'module';
 import * as path from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'url';
-import type { ConfigEnv, EnvironmentOptions, Plugin, ResolvedConfig, UserConfig } from 'vite';
+import type {
+  Alias,
+  ConfigEnv,
+  EnvironmentOptions,
+  Plugin,
+  ResolvedConfig,
+  UserConfig,
+} from 'vite';
 import { version as viteVersion } from 'vite';
 import { createVirtualModuleLoading } from './virtualModuleLoading';
 import { createDependencyPreparation } from './dependencyPreparation';
@@ -23,9 +30,11 @@ import aliasToArrayPlugin from './utils/aliasToArrayPlugin';
 import { escapeRegExp } from './utils/regexEscape';
 import {
   collectLoadShareProxyChunks,
-  collectSystemProxyInfos,
+  collectSystemProxyExports,
+  isOutputChunk,
   rewriteEsmProxyConsumers,
   rewriteSystemProxyConsumers,
+  type Bundle,
 } from './utils/bundleHelpers';
 import { normalizePathForImport } from './utils/buildPaths';
 import {
@@ -91,8 +100,8 @@ import { getRuntimeInitStatusImportId } from './virtualModules/virtualRuntimeIni
 import { findEagerFallbacksInSharedChunk } from './virtualModules/loadShareSharedChunk';
 import { resetConcreteSharedImportSourceCache } from './virtualModules/virtualShared_preBuild';
 
-type ViteWatchOptions = NonNullable<NonNullable<UserConfig['server']>['watch']>;
-type ViteWatchConfig = ViteWatchOptions | boolean | null | undefined;
+// Accept legacy boolean watch settings as well as Vite's current options.
+type ViteWatchConfig = NonNullable<UserConfig['server']>['watch'] | boolean;
 
 function normalizeVinextRscPreloadHints(code: string): string {
   return code
@@ -100,12 +109,12 @@ function normalizeVinextRscPreloadHints(code: string): string {
     .replace(/(:HL\[[^\]\n]*?,)\\"stylesheet\\"/g, '$1\\"style\\"');
 }
 
-function ignoreFederationGeneratedFiles(
-  config: UserConfig,
+function ignoreGeneratedFiles(
+  config: { server?: { watch?: ViteWatchConfig } },
   options: NormalizedModuleFederationOptions
 ): void {
   config.server ??= {};
-  const watch = config.server.watch as ViteWatchConfig;
+  const watch = config.server.watch;
 
   if (watch === false || watch === null) {
     return;
@@ -114,38 +123,22 @@ function ignoreFederationGeneratedFiles(
   const watchOptions = watch === true || watch === undefined ? {} : watch;
   config.server.watch = watchOptions;
 
-  const federationIgnore = (file: string) => shouldIgnoreFile(file, options);
+  const ignoreFile = (file: string) => shouldIgnoreFile(file, options);
   const ignored = watchOptions.ignored;
   if (!ignored) {
-    watchOptions.ignored = federationIgnore;
+    watchOptions.ignored = ignoreFile;
     return;
   }
   if (Array.isArray(ignored)) {
-    ignored.push(federationIgnore);
+    ignored.push(ignoreFile);
     return;
   }
-  watchOptions.ignored = [ignored, federationIgnore];
+  watchOptions.ignored = [ignored, ignoreFile];
 }
 
-type ModulePreloadResolveContext = { hostId: string; hostType: 'html' | 'js' };
-type ResolveAliasEntry = { find: string | RegExp; replacement: string };
-type BundleChunkLike = {
-  type: 'chunk';
-  fileName: string;
-  code: string;
-  imports?: string[];
-  modules?: Record<string, unknown>;
-};
-type BundleAssetLike = { type: 'asset'; fileName: string };
-type BundleLike = Record<string, BundleChunkLike | BundleAssetLike>;
 type NormalizedOutputOptionsLike = { dir?: string };
-type RenderedChunkLike = { fileName: string };
 
-function isOutputChunk(chunk: BundleLike[string]): chunk is BundleChunkLike {
-  return chunk.type === 'chunk';
-}
-
-function appendResolveAlias(config: UserConfig, alias: ResolveAliasEntry): void {
+function appendResolveAlias(config: UserConfig, alias: Alias): void {
   const resolve = (config.resolve ??= {});
   const existingAlias = resolve.alias;
   if (!existingAlias) {
@@ -162,12 +155,11 @@ function appendResolveAlias(config: UserConfig, alias: ResolveAliasEntry): void 
   ];
 }
 
-// `<dir>/index.js` runtime entry, captured as (directory, extension) so the
-// sibling `helpers` module can be addressed with the same extension.
+// Capture the runtime directory and extension to find its helpers module.
 const RUNTIME_INDEX_ENTRY_RE = /^(.*[\\/])index(\.[cm]?js)$/;
 const TRAILING_SLASH_RE = /\/$/;
 
-function getRuntimeHelpersImplementation(runtimeImplementation: string): string {
+function getRuntimeHelpersImport(runtimeImplementation: string): string {
   const indexEntryMatch = RUNTIME_INDEX_ENTRY_RE.exec(runtimeImplementation);
   if (indexEntryMatch) {
     return normalizePathForImport(`${indexEntryMatch[1]}helpers${indexEntryMatch[2]}`);
@@ -202,13 +194,13 @@ const UNSAFE_JS_SOURCE_CHAR_MAP: Record<string, string> = {
   '\u2029': '\\u2029',
 };
 
-function escapeUnsafeJsSourceChars(str: string): string {
+function escapeUnsafeJavaScriptCharacters(str: string): string {
   return str.replace(/[<>/\\\b\f\n\r\t\0\u2028\u2029]/g, (char) => {
     return UNSAFE_JS_SOURCE_CHAR_MAP[char] ?? char;
   });
 }
 
-function isFederationHtmlPreloadDependency(dep: string, includeSharedRuntime = false): boolean {
+function isRuntimePreloadDependency(dep: string, includeSharedRuntime = false): boolean {
   const file = path.basename(dep);
   if (
     file.includes('__mfe_internal__') ||
@@ -227,21 +219,19 @@ function isFederationHtmlPreloadDependency(dep: string, includeSharedRuntime = f
   );
 }
 
-// React Router's build plugin appends a synthetic `?__react-router-build-client-route`
-// entry per route that isn't a real module on disk, so it must be excluded before this
-// scan tries to read it as a source file.
+// React Router adds ?__react-router-build-client-route entries that have no source
+// file. Skip them when scanning imports.
 function isReactRouterBuildClientRouteInput(entry: string): boolean {
   return /[?&]__react-router-build-client-route(?:[=&]|$)/.test(entry);
 }
 
 /**
- * Files whose JSX the compiler rewrites to an automatic-runtime import.
- * Vite only applies the JSX transform to these extensions by default.
+ * Vite transforms JSX in these file types and can add a JSX runtime import.
  */
 const JSX_SOURCE_EXTENSIONS = ['.jsx', '.tsx'];
 
 type JsxTransformOptions = {
-  jsx?: string | { runtime?: string; importSource?: string; development?: boolean };
+  jsx?: string | boolean | { runtime?: string; importSource?: string; development?: boolean };
   jsxImportSource?: string;
   jsxDev?: boolean;
 };
@@ -249,7 +239,7 @@ type JsxTransformOptions = {
 function getAutomaticJsxRuntime(config: ResolvedConfig): string | undefined {
   for (const candidate of [config.oxc, config.esbuild]) {
     if (!candidate || typeof candidate !== 'object') continue;
-    const transform = candidate as JsxTransformOptions;
+    const transform: JsxTransformOptions = candidate;
     const jsx = transform.jsx;
     const runtime = typeof jsx === 'object' ? jsx.runtime : jsx;
     if (runtime && runtime !== 'automatic') return undefined;
@@ -385,9 +375,9 @@ function scanEntryImports(
   return hasJsxFiles;
 }
 
-// The compiler injects this import after the textual entry scan. Materialize
-// the resolved runtime and its configured root even when optimizeDeps is warm.
-function materializeAutomaticJsxRuntime(
+// JSX compilation adds an import after the source scan. Register the JSX runtime
+// and its shared package even when Vite reuses cached optimized dependencies.
+function registerJsxRuntimeImports(
   options: NormalizedModuleFederationOptions,
   runtime: string
 ): boolean {
@@ -401,21 +391,20 @@ function materializeAutomaticJsxRuntime(
 }
 
 /**
- * Plugin that runs FIRST to register generated virtual modules in the config hook.
- * This prevents 504 "Outdated Optimize Dep" errors by ensuring ids are known
- * before Vite's optimization phase.
+ * Registers virtual modules in the config hook before dependency optimization.
+ * This prevents 504 "Outdated Optimize Dep" errors from modules registered too late.
  */
 function createEarlyVirtualModulesPlugin(
   options: NormalizedModuleFederationOptions,
-  dependencies: ReturnType<typeof createDependencyPreparation>
+  dependencySetup: ReturnType<typeof createDependencyPreparation>
 ): Plugin {
   const { shared, remotes } = options;
-  let hasClientJsxSource = false;
+  let hasClientJsxFiles = false;
   return {
     name: 'vite:module-federation-early-init',
     enforce: 'pre',
-    config(config: UserConfig, { command: _command }) {
-      if (_command === 'serve') ignoreFederationGeneratedFiles(config, options);
+    config(config: UserConfig, { command }) {
+      if (command === 'serve') ignoreGeneratedFiles(config, options);
 
       const root = config.root || process.cwd();
       const buildInput = getBuildInput(config);
@@ -427,7 +416,7 @@ function createEarlyVirtualModulesPlugin(
             : buildInput && typeof buildInput === 'object'
               ? Object.values(buildInput)
               : [];
-      const resolvedConfiguredEntryFiles = configuredEntryFiles
+      const resolvedEntryFiles = configuredEntryFiles
         .map((entry) => String(entry))
         .filter((entry) => !isReactRouterBuildClientRouteInput(entry))
         .map((entry) => entry.split(/[?#]/)[0])
@@ -437,52 +426,46 @@ function createEarlyVirtualModulesPlugin(
       resolveSharedVersions(shared, root);
       const isVinext = hasPackageDependency('vinext');
 
-      // Configure SSR runtime with the host's remotes so server-side loadRemote
-      // knows the entry URL for each remote when ssrEntryLoader intercepts it.
-      // Create core virtual modules
-      initVirtualModules(_command, getRemoteEntryId(options), false, options);
+      // Register the runtime and remote entry virtual modules.
+      initVirtualModules(command, getRemoteEntryId(options), false, options);
 
       const isRolldown = getIsRolldown(this);
 
-      // Eagerly register configured remotes before localSharedImportMap is
-      // first written. In build, remoteEntry can be traced before app modules
-      // hit the remote alias resolver, which otherwise leaves usedRemotes empty
-      // in the emitted localSharedImportMap chunk.
-      // Register the remote key only — a configured alias is not an imported
-      // root (`.`) expose. Actual modules are recorded when the app imports them.
+      // A build can load remoteEntry before resolving the application's imports.
+      // Register remote aliases now so localSharedImportMap includes them.
+      // Register individual exposed modules when the application imports them.
       if (remotes && Object.keys(remotes).length > 0) {
         for (const key of Object.keys(remotes)) {
           ensureUsedRemote(key, options);
         }
-        dependencies.excludeRemotesFromOptimization(config, _command);
+        dependencySetup.excludeRemotesFromOptimization(config, command);
       }
 
       if (!config.build?.ssr && (hasShared(options) || hasRemotes(options))) {
-        // The static remote registry is also needed by the production host
-        // bootstrap. Keep share/optimize-deps discovery serve-only, but scan
-        // the same client entry graph during build so the bootstrap can wait
-        // for only the remotes imported synchronously by that graph.
-        const hasJsxSource = scanEntryImports(
+        // Scan static remote imports during builds too, so host initialization
+        // waits for the remote modules needed at startup. Register shared imports
+        // only in the dev server, where they affect dependency optimization.
+        const hasJsxFiles = scanEntryImports(
           options,
           root,
-          _command === 'serve',
-          resolvedConfiguredEntryFiles
+          command === 'serve',
+          resolvedEntryFiles
         );
-        if (_command === 'serve') hasClientJsxSource = hasJsxSource;
+        if (command === 'serve') hasClientJsxFiles = hasJsxFiles;
       }
 
-      dependencies.prepareSharedDependencies(config, {
+      dependencySetup.prepareSharedDependencies(config, {
         root,
-        command: _command,
+        command,
         isRolldown,
         isVinext,
       });
     },
 
     configResolved(config) {
-      if (hasClientJsxSource) {
+      if (hasClientJsxFiles) {
         const automaticJsxRuntime = getAutomaticJsxRuntime(config);
-        if (automaticJsxRuntime && materializeAutomaticJsxRuntime(options, automaticJsxRuntime)) {
+        if (automaticJsxRuntime && registerJsxRuntimeImports(options, automaticJsxRuntime)) {
           writeLocalSharedImportMap(options);
         }
       }
@@ -490,7 +473,7 @@ function createEarlyVirtualModulesPlugin(
       const viteMajor = parseInt(viteVersion, 10);
       const ssrCapabilities = getSsrCapabilities(
         viteMajor,
-        config.command as 'serve' | 'build',
+        config.command,
         hasRemotes(options),
         isSsrConfig(config)
       );
@@ -521,20 +504,19 @@ function createEarlyVirtualModulesPlugin(
           try {
             resolvedShared[pkg] = resolveImportPath(pkg);
           } catch {
-            // Not installed at either location — ssrEntryLoader falls back to
-            // runtime resolution from the host app.
+            // ssrEntryLoader will try resolving the package from the host at runtime.
           }
         }
       }
 
-      // Only inject when the built subpath export exists. Integration tests
-      // run against src/ before a build, so the lib/ export won't be present.
-      // Users can still inject manually via runtimePlugins in that case.
-      const ssrEntryLoaderSpecifier = SSR_ENTRY_LOADER_SPECIFIER;
+      // Add ssrEntryLoader only when its built file exists in lib/.
+      // Tests using src/ may run before a build. runtimePlugins still allows
+      // applications to configure the loader themselves.
+      const ssrLoaderImport = SSR_ENTRY_LOADER_SPECIFIER;
       try {
-        resolveImportPath(ssrEntryLoaderSpecifier);
+        resolveImportPath(ssrLoaderImport);
         options.runtimePlugins.push([
-          ssrEntryLoaderSpecifier,
+          ssrLoaderImport,
           {
             resolvedShared,
             ...(options.ssrEntryLoader?.strategy
@@ -543,7 +525,7 @@ function createEarlyVirtualModulesPlugin(
           },
         ]);
       } catch {
-        // lib/ not built yet — skip silently
+        // The loader has not been built yet.
       }
     },
   };
@@ -611,7 +593,7 @@ function resolveInjectExternalRuntimeCorePlugin(): string {
   try {
     return normalizePathForImport(resolveImportPath(INJECT_EXTERNAL_RUNTIME_CORE_PLUGIN));
   } catch {
-    // Dev/test before `lib/` exists: resolve the source/companion file beside this module.
+    // Before lib/ is built, resolve the source file beside this module.
     for (const rel of [
       './utils/injectExternalRuntimeCorePlugin.js',
       './utils/injectExternalRuntimeCorePlugin.ts',
@@ -648,31 +630,30 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
 
   const remoteEntryId = getRemoteEntryId(options);
   const virtualExposesId = getVirtualExposesId(options);
-  const loading = createVirtualModuleLoading(options, remoteEntryId, virtualExposesId);
+  const virtualModules = createVirtualModuleLoading(options, remoteEntryId, virtualExposesId);
   const chunkPlacement = createChunkPlacement(options);
-  const dependencies = createDependencyPreparation(options);
+  const dependencySetup = createDependencyPreparation(options);
   const emittedRuntimeCapabilityWarnings = new Set<string>();
 
   return [
-    loading.loaderPlugin,
+    virtualModules.loaderPlugin,
     ...(options.experiments.externalRuntime ? [pluginExternalRuntimeCore()] : []),
-    // This plugin runs FIRST to register virtual modules before optimization
-    createEarlyVirtualModulesPlugin(options, dependencies),
+    // Register virtual modules before Vite optimizes dependencies.
+    createEarlyVirtualModulesPlugin(options, dependencySetup),
     ...(isVinext
       ? [
           {
             name: 'module-federation-vinext-react-server-build-alias',
-            apply: 'build' as const,
-            enforce: 'pre' as const,
-            resolveId(id: string) {
+            apply: 'build',
+            enforce: 'pre',
+            resolveId(id) {
               const reactServerEntryMap: Record<string, string> = {
                 'react/jsx-runtime': 'react/cjs/react-jsx-runtime.production.js',
                 'react/jsx-dev-runtime': 'react/cjs/react-jsx-dev-runtime.production.js',
                 'react/compiler-runtime': 'react/cjs/react-compiler-runtime.production.js',
               };
               if (!(id in reactServerEntryMap)) return;
-              const environmentName = (this as { environment?: { name?: string } }).environment
-                ?.name;
+              const environmentName = this.environment?.name;
               if (!environmentName || environmentName === 'client') return;
 
               const target = reactServerEntryMap[id];
@@ -682,33 +663,32 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
               const reactPackageJson = projectRequire.resolve('react/package.json');
               return path.join(path.dirname(reactPackageJson), target.replace(/^react\//, ''));
             },
-          },
+          } satisfies Plugin,
         ]
       : []),
-    loading.initializationPlugin,
+    virtualModules.initializationPlugin,
     aliasToArrayPlugin,
     checkAliasConflicts({ shared }),
-    dependencies.optimizeDepsPlugin,
+    dependencySetup.optimizeDepsPlugin,
     ...loadPluginDts(options),
     pluginDevRemoteHmr(options),
     {
-      // Some frameworks (e.g. TanStack Start) assume the bundle has exactly one
-      // isEntry chunk and throw when they see extras. MF emits additional entry
-      // chunks (hostInit, remoteEntry) that are not the real app
-      // entry. Mark them as non-entry before any framework scanner runs.
+      // Frameworks such as TanStack Start expect one application entry chunk.
+      // Clear isEntry on generated chunks such as hostInit and remoteEntry before
+      // framework plugins inspect the bundle.
       name: 'mf:normalize-entry-chunks',
       enforce: 'pre',
       apply: 'build',
-      generateBundle(_options: unknown, bundle: Record<string, unknown>) {
+      generateBundle(_options, bundle) {
         for (const chunk of Object.values(bundle)) {
           if (
             typeof chunk !== 'object' ||
             chunk === null ||
-            (chunk as { type: string }).type !== 'chunk' ||
-            !(chunk as { isEntry: boolean }).isEntry
+            chunk.type !== 'chunk' ||
+            !chunk.isEntry
           )
             continue;
-          const facadeId = (chunk as { facadeModuleId?: string }).facadeModuleId ?? '';
+          const facadeId = chunk.facadeModuleId ?? '';
           if (
             facadeId.includes('__mf__virtual') ||
             facadeId.startsWith('virtual:mf-') ||
@@ -716,11 +696,11 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
             facadeId.startsWith('\0virtual:mf-') ||
             facadeId.startsWith('\0virtual:mf:')
           ) {
-            (chunk as { isEntry: boolean }).isEntry = false;
+            chunk.isEntry = false;
           }
         }
       },
-    },
+    } satisfies Plugin,
     ...addEntry({
       entryName: 'remoteEntry',
       entryPath: remoteEntryId,
@@ -739,15 +719,15 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
       options,
       remoteEntryId,
       virtualExposesId,
-      getParsePromise: loading.getImportAnalysisPromise,
+      getParsePromise: virtualModules.getImportAnalysisPromise,
     }),
     pluginProxyRemotes(options),
     pluginRemoteNamedExports(options),
-    ...loading.importAnalysisPlugins,
+    ...virtualModules.importAnalysisPlugins,
     ...proxySharedModule({
       shared,
       federationOptions: options,
-      getParsePromise: loading.getImportAnalysisPromise,
+      getParsePromise: virtualModules.getImportAnalysisPromise,
     }),
     pluginLazyConsumeOnlyShares(options),
     {
@@ -755,14 +735,12 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
       enforce: 'pre',
       apply: 'build',
       config(config: UserConfig) {
-        loading.configureSsrBuild(config);
+        virtualModules.configureSsrBuild(config);
         const runtimeInitId = getRuntimeInitStatusImportId(options);
         config.build = config.build || {};
 
         if (config.build.modulePreload !== false) {
-          // The configured filename may carry a `[hash]` placeholder (the default
-          // is `remoteEntry-[hash]`, emitted as `remoteEntry-<hash>.js`); match
-          // the emitted file, not the pattern.
+          // Match emitted filenames after [hash] is replaced and .js is added.
           const remoteEntryBasename = path.posix.basename(options.filename);
           const hashParts = remoteEntryBasename.split(/\[hash(?::\d+)?\]/);
           const remoteEntryFilePattern = new RegExp(
@@ -780,40 +758,32 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
 
           config.build.modulePreload = {
             ...currentModulePreload,
-            resolveDependencies(
-              filename: string,
-              deps: string[],
-              context: ModulePreloadResolveContext
-            ) {
+            resolveDependencies(filename, deps, context) {
               const resolvedDeps = existingResolveDependencies
                 ? existingResolveDependencies(filename, deps, context)
                 : deps;
               const hostFile = path.basename(context.hostId);
-              const shouldSkipFederationPreload =
+              const skipRuntimePreloads =
                 context.hostType === 'js' &&
                 (isRemoteEntryFile(hostFile) ||
                   hostFile.includes('hostInit') ||
                   hostFile.includes('localSharedImportMap'));
 
-              if (shouldSkipFederationPreload) return [];
+              if (skipRuntimePreloads) return [];
 
-              const hasFederationHtmlDeps =
-                context.hostType === 'html' &&
-                resolvedDeps.some((dep) => isFederationHtmlPreloadDependency(dep));
-              const hasFederationJsDeps =
-                context.hostType === 'js' &&
-                resolvedDeps.some((dep) => isFederationHtmlPreloadDependency(dep));
+              const hasRuntimeDeps =
+                (context.hostType === 'html' || context.hostType === 'js') &&
+                resolvedDeps.some((dep) => isRuntimePreloadDependency(dep));
 
-              const treeShakingFallbackDeps = hasTreeShakingShared
+              const isTreeShakingFallback = hasTreeShakingShared
                 ? (dep: string) => dep.includes('__prebuild__')
                 : () => false;
 
-              return hasFederationHtmlDeps || hasFederationJsDeps
+              return hasRuntimeDeps
                 ? resolvedDeps.filter(
-                    (dep) =>
-                      !isFederationHtmlPreloadDependency(dep, true) && !treeShakingFallbackDeps(dep)
+                    (dep) => !isRuntimePreloadDependency(dep, true) && !isTreeShakingFallback(dep)
                   )
-                : resolvedDeps.filter((dep) => !treeShakingFallbackDeps(dep));
+                : resolvedDeps.filter((dep) => !isTreeShakingFallback(dep));
             },
           };
         }
@@ -821,10 +791,10 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
         chunkPlacement.configureBuildOutputs(config.build, runtimeInitId);
       },
       buildApp: chunkPlacement.restoreOutputFileNames,
-      load: loading.loadForBuild,
+      load: virtualModules.loadForBuild,
       generateBundle(
         _outputOptions: NormalizedOutputOptionsLike,
-        bundle: BundleLike,
+        bundle: Bundle,
         _isWrite: boolean
       ) {
         for (const [fileName, fallbacks] of findEagerFallbacksInSharedChunk(bundle)) {
@@ -844,25 +814,15 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
           chunk.code = sanitizeFederationControlChunk(chunk.code, fileName, filename);
         }
 
-        // Break transitive proxy deadlock.
-        //
-        // Rollup's CJS plugin creates commonjs-proxy wrapper chunks for
-        // loadShare modules. These proxies share CJS helpers
-        // (getDefaultExportFromCjs, getAugmentedNamespace) with prebuild
-        // chunks (react, react-dom). This creates a transitive dependency:
-        //   prebuild chunk -> commonjs-proxy -> loadShare chunk
-        // When get() dynamically imports the prebuild chunk during
-        // loadShare execution, it blocks on itself, causing deadlock.
-        //
-        // Fix: extract helper functions from commonjs-proxy chunks and
-        // inline them in consuming chunks, then remove the proxy imports.
+        // Rollup's CommonJS helpers can make a local fallback import a proxy that
+        // imports loadShare. If loadShare is waiting for that fallback, neither
+        // can finish loading. Copy the helper functions into importing chunks
+        // and remove their proxy imports to break the circular dependency.
         const proxyChunks = collectLoadShareProxyChunks(bundle, LOAD_SHARE_TAG);
         if (proxyChunks.size > 0) {
-          const systemProxyInfo = collectSystemProxyInfos(proxyChunks, LOAD_SHARE_TAG);
+          const systemProxyExports = collectSystemProxyExports(proxyChunks, LOAD_SHARE_TAG);
 
-          // Extract helper functions from each proxy chunk.
-          // Proxy chunks export: standalone helpers + wrapped loadShare namespace.
-          // We only inline the standalone helpers; namespace deps are redirected.
+          // Copy helper functions; keep module imports pointing to loadShare.
           for (const [fileName, chunk] of Object.entries(bundle)) {
             if (!isOutputChunk(chunk)) continue;
             if (proxyChunks.has(fileName)) continue;
@@ -872,7 +832,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
               code = rewriteEsmProxyConsumers(code, proxyChunks);
             }
 
-            code = rewriteSystemProxyConsumers(code, systemProxyInfo);
+            code = rewriteSystemProxyConsumers(code, systemProxyExports);
 
             if (code !== chunk.code) {
               chunk.code = code;
@@ -883,16 +843,16 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
     },
     {
       name: 'module-federation-strip-empty-preload-helper',
-      enforce: 'post' as const,
-      apply: 'build' as const,
-      renderChunk(code: string, chunk: RenderedChunkLike) {
+      enforce: 'post',
+      apply: 'build',
+      renderChunk(code, chunk) {
         if (!isFederationControlChunk(chunk.fileName, filename)) return;
 
         const nextCode = sanitizeFederationControlChunk(code, chunk.fileName, filename);
 
         return nextCode === code ? null : { code: nextCode, map: null };
       },
-      writeBundle(outputOptions: NormalizedOutputOptionsLike, bundle: BundleLike) {
+      writeBundle(outputOptions, bundle) {
         if (!outputOptions.dir) return;
 
         for (const chunk of Object.values(bundle)) {
@@ -909,21 +869,21 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
           writeFileSync(outputPath, nextCode);
         }
       },
-    },
+    } satisfies Plugin,
     {
       name: 'module-federation-vite',
       enforce: 'post',
-      // used to expose plugin options: https://github.com/rolldown/rolldown/discussions/2577#discussioncomment-11137593
+      // Expose options to other plugins: https://github.com/rolldown/rolldown/discussions/2577#discussioncomment-11137593
       _options: options,
-      config(config: UserConfig, { command: _command }: ConfigEnv) {
+      config(config: UserConfig, { command }: ConfigEnv) {
         const isRolldown = getIsRolldown(this);
-        loading.configureSsrBuild(config, _command);
+        virtualModules.configureSsrBuild(config, command);
         const needsRuntimeHelpers = hasShared(options);
 
         if (needsRuntimeHelpers) {
           appendResolveAlias(config, {
             find: /^@module-federation\/runtime\/helpers$/,
-            replacement: getRuntimeHelpersImplementation(options.implementation),
+            replacement: getRuntimeHelpersImport(options.implementation),
           });
         }
 
@@ -934,7 +894,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
         config.build ||= {};
         config.build.commonjsOptions ||= {};
         config.build.commonjsOptions.strictRequires ??= 'auto';
-        dependencies.includeRuntimeDependencies(config, needsRuntimeHelpers);
+        dependencySetup.includeRuntimeDependencies(config, needsRuntimeHelpers);
 
         if (isRolldown) {
           // Vite 8+: virtual modules use ESM.
@@ -943,8 +903,8 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
         }
 
         const isAstro = hasPackageDependency('astro');
-        // Resolve target: explicit option > SSR detection > 'web'
-        // (Environment API server/ssr targets are set in configEnvironment.)
+        // Use the configured target, or infer it from build.ssr.
+        // configEnvironment handles Vite's separate server environments.
         const resolvedTarget = options.target ?? (config.build?.ssr ? 'node' : 'web');
 
         if (!config.define) config.define = {};
@@ -961,12 +921,9 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
         }
       },
       configResolved(config: ResolvedConfig) {
-        // TanStack Start/Nitro performs its server build from a deferred
-        // closeBundle task. Some example integrations add a build-exit hook
-        // that calls process.exit() immediately, which aborts that task after
-        // the client build and leaves .output/server/index.mjs missing.
-        // Disable only that explicitly named workaround; other exit hooks and
-        // non-Nitro projects remain untouched.
+        // Nitro starts its server build in closeBundle. Disable the example's
+        // tanstack-build-exit hook so it cannot exit after the client build,
+        // before .output/server/index.mjs is written.
         if (!hasPackageDependency('nitro')) return;
         const prematureExit = config.plugins.find(
           (plugin) => plugin.name === 'tanstack-build-exit'
@@ -976,11 +933,11 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
         }
       },
       configEnvironment(name: string, config: EnvironmentOptions) {
-        // Client graphs keep ENV_TARGET from root config(); only server/ssr envs need node.
+        // Server environments need ENV_TARGET=node; clients use the root config value.
         if (!isServerEnvironment(name, config)) return;
 
         const isAstro = hasPackageDependency('astro');
-        // Copy define per environment — Vite may reuse the same object across envs.
+        // Copy define because Vite may share this object between environments.
         config.define = { ...(config.define ?? {}) };
         applyBuildTimeRuntimeDefines(config.define, options, {
           target: options.target ?? 'node',
@@ -994,7 +951,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
     ...pluginVarRemoteEntry(options),
     {
       name: 'module-federation-vinext-fix-rsc-preload-as',
-      enforce: 'post' as const,
+      enforce: 'post',
       configureServer(server) {
         if (!hasPackageDependency('vinext')) return;
 
@@ -1021,7 +978,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
           next();
         });
       },
-      generateBundle(_: NormalizedOutputOptionsLike, bundle: BundleLike, _isWrite: boolean) {
+      generateBundle(_: NormalizedOutputOptionsLike, bundle: Bundle, _isWrite: boolean) {
         if (!hasPackageDependency('vinext')) return;
 
         for (const chunk of Object.values(bundle)) {
@@ -1035,44 +992,34 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
         }
       },
     } satisfies Plugin,
-    // Fix preload helper for federated remotes: Vite's preload helper resolves
-    // asset URLs against the page origin (e.g. host), but remote chunks need
-    // to resolve against their own origin. Replace the hardcoded base URL
-    // function with import.meta.url-based resolution.
+    // Resolve remote asset URLs relative to the remote module's import.meta.url,
+    // rather than the host page's URL.
     ...(function () {
-      let disablePreload = false;
+      let skipPreloadRewrite = false;
 
       return Object.keys(options.exposes).length > 0
         ? [
             {
               name: 'module-federation-fix-preload',
-              enforce: 'post' as const,
-              apply: 'build' as const,
+              enforce: 'post',
+              apply: 'build',
               config(_config, { command }) {
                 const manifest = options.manifest;
-                const getDefaultDisableAssetsAnalyze = (cfgCommand: string | undefined) =>
-                  cfgCommand === 'serve' &&
-                  (typeof manifest !== 'object' ||
-                    !Object.hasOwn(manifest, 'disableAssetsAnalyze'));
-
-                const getConfiguredDisableAssetsAnalyze = (cfgCommand: string | undefined) => {
-                  if (typeof manifest === 'object' && manifest !== null) {
-                    if (Object.hasOwn(manifest, 'disableAssetsAnalyze')) {
-                      return manifest.disableAssetsAnalyze === true;
-                    }
-                  }
-
-                  return getDefaultDisableAssetsAnalyze(cfgCommand);
-                };
-
-                disablePreload = getConfiguredDisableAssetsAnalyze(command);
+                skipPreloadRewrite =
+                  typeof manifest === 'object' &&
+                  manifest !== null &&
+                  Object.hasOwn(manifest, 'disableAssetsAnalyze')
+                    ? manifest.disableAssetsAnalyze === true
+                    : command === 'serve' &&
+                      (typeof manifest !== 'object' ||
+                        !Object.hasOwn(manifest, 'disableAssetsAnalyze'));
               },
               generateBundle(
                 _outputOptions: NormalizedOutputOptionsLike,
-                bundle: BundleLike,
+                bundle: Bundle,
                 _isWrite: boolean
               ) {
-                if (disablePreload) return;
+                if (skipPreloadRewrite) return;
 
                 for (const chunk of Object.values(bundle)) {
                   if (!isOutputChunk(chunk)) continue;
@@ -1083,7 +1030,7 @@ function federation(mfUserOptions: ModuleFederationOptions): any[] {
                       ? ''
                       : `${normalizePathForImport(path.relative(chunkDir, '.'))}/`;
                   const replacementExpr = prefixToRoot
-                    ? `${escapeUnsafeJsSourceChars(JSON.stringify(prefixToRoot))}+$1`
+                    ? `${escapeUnsafeJavaScriptCharacters(JSON.stringify(prefixToRoot))}+$1`
                     : '$1';
                   // Match Vite's preload helper asset URL function across minifiers:
                   //   Vite 8+:  t=function(e){return`/`+e}
